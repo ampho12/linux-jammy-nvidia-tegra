@@ -1064,14 +1064,15 @@ static int mcp251xfd_chip_interrupts_disable(const struct mcp251xfd_priv *priv)
 	return regmap_write(priv->map_reg, MCP251XFD_REG_CRC, 0);
 }
 
-static int mcp251xfd_chip_stop(struct mcp251xfd_priv *priv,
-			       const enum can_state state)
+static void mcp251xfd_chip_stop(struct mcp251xfd_priv *priv,
+				const enum can_state state)
 {
 	priv->can.state = state;
 
 	mcp251xfd_chip_interrupts_disable(priv);
 	mcp251xfd_chip_rx_int_disable(priv);
-	return mcp251xfd_chip_set_mode(priv, MCP251XFD_REG_CON_MODE_SLEEP);
+	mcp251xfd_timestamp_stop(priv);
+	mcp251xfd_chip_set_mode(priv, MCP251XFD_REG_CON_MODE_CONFIG);
 }
 
 static int mcp251xfd_chip_start(struct mcp251xfd_priv *priv)
@@ -1134,6 +1135,15 @@ static int mcp251xfd_set_mode(struct net_device *ndev, enum can_mode mode)
 		if (err) {
 			mcp251xfd_chip_stop(priv, CAN_STATE_STOPPED);
 			return err;
+		}
+
+		/* Re-enable IRQ at the controller level if it was
+		 * masked by disable_irq_nosync() in out_fail due to
+		 * an SPI error before bus-off triggered this restart.
+		 */
+		if (priv->irq_disabled) {
+			priv->irq_disabled = false;
+			enable_irq(priv->spi->irq);
 		}
 
 		netif_wake_queue(ndev);
@@ -2334,10 +2344,27 @@ static irqreturn_t mcp251xfd_irq(int irq, void *dev_id)
 	netdev_err(priv->ndev, "IRQ handler returned %d (intf=0x%08x).\n",
 		   err, priv->regs_status.intf);
 	mcp251xfd_dump(priv);
-	mcp251xfd_chip_interrupts_disable(priv);
-	mcp251xfd_timestamp_stop(priv);
 
-	return handled;
+	/* Stop the chip and schedule a restart using the same
+	 * recovery path as bus-off. chip_stop() puts the chip in
+	 * config mode (SPI-accessible but off the CAN bus) and
+	 * disables chip-level interrupts. can_bus_off() schedules
+	 * a restart via restart_ms if configured.
+	 *
+	 * We also mask the IRQ at the controller level to prevent
+	 * an IRQ storm: if SPI is unreliable, chip_stop()'s SPI
+	 * writes may have failed, leaving the INT pin asserted.
+	 * The IRQ is re-enabled by mcp251xfd_set_mode(START) when
+	 * the restart fires.
+	 */
+	mcp251xfd_chip_stop(priv, CAN_STATE_BUS_OFF);
+	if (!priv->irq_disabled) {
+		priv->irq_disabled = true;
+		disable_irq_nosync(priv->spi->irq);
+	}
+	can_bus_off(priv->ndev);
+
+	return IRQ_HANDLED;
 }
 
 static inline struct
@@ -2576,7 +2603,6 @@ static int mcp251xfd_open(struct net_device *ndev)
 	free_irq(spi->irq, priv);
  out_can_rx_offload_disable:
 	can_rx_offload_disable(&priv->offload);
-	mcp251xfd_timestamp_stop(priv);
  out_transceiver_disable:
 	mcp251xfd_transceiver_disable(priv);
  out_mcp251xfd_ring_free:
@@ -2598,7 +2624,6 @@ static int mcp251xfd_stop(struct net_device *ndev)
 	mcp251xfd_chip_interrupts_disable(priv);
 	free_irq(ndev->irq, priv);
 	can_rx_offload_disable(&priv->offload);
-	mcp251xfd_timestamp_stop(priv);
 	mcp251xfd_chip_stop(priv, CAN_STATE_STOPPED);
 	mcp251xfd_transceiver_disable(priv);
 	mcp251xfd_ring_free(priv);
