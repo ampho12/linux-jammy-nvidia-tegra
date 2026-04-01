@@ -1304,11 +1304,16 @@ static int mcp251xfd_tef_ring_update(struct mcp251xfd_priv *priv)
 	const struct mcp251xfd_tx_ring *tx_ring = priv->tx;
 	unsigned int new_head;
 	u8 chip_tx_tail;
+	u32 fifo_sta;
 	int err;
 
-	err = mcp251xfd_tx_tail_get_from_chip(priv, &chip_tx_tail);
+	err = regmap_read(priv->map_reg,
+			  MCP251XFD_REG_FIFOSTA(MCP251XFD_TX_FIFO),
+			  &fifo_sta);
 	if (err)
 		return err;
+
+	chip_tx_tail = FIELD_GET(MCP251XFD_REG_FIFOSTA_FIFOCI_MASK, fifo_sta);
 
 	/* chip_tx_tail, is the next TX-Object send by the HW.
 	 * The new TEF head must be >= the old head, ...
@@ -1319,6 +1324,23 @@ static int mcp251xfd_tef_ring_update(struct mcp251xfd_priv *priv)
 
 	/* ... but it cannot exceed the TX head. */
 	priv->tef->head = min(new_head, tx_ring->head);
+
+	/* Workaround for erratum DS80000789E 6.:
+	 *
+	 * Reading the FIFOCI bits of the FIFOSTA register may
+	 * return corrupted values. This can cause tef->head to
+	 * equal tef->tail (len=0), even though transmitted frames
+	 * are pending. A subsequent regmap_bulk_read() with
+	 * val_count=0 returns -EINVAL, crashing the IRQ handler.
+	 *
+	 * If the chip reports head == tail (len=0), but the TX-FIFO
+	 * is less than half full and no TX ring buffers are free,
+	 * all frames must have been sent. Assume TEF is full.
+	 */
+	if (priv->tef->head == priv->tef->tail &&
+	    (fifo_sta & MCP251XFD_REG_FIFOSTA_TFHRFHIF) &&
+	    mcp251xfd_get_tx_free(tx_ring) == 0)
+		priv->tef->head = priv->tef->tail + tx_ring->obj_num;
 
 	return mcp251xfd_check_tef_tail(priv);
 }
@@ -1340,6 +1362,13 @@ mcp251xfd_tef_obj_read(const struct mcp251xfd_priv *priv,
 			   tx_ring->obj_num, offset, len);
 		return -ERANGE;
 	}
+
+	/* Guard against len=0: regmap_bulk_read() returns -EINVAL for
+	 * val_count=0. This can happen when erratum DS80000789E 6.
+	 * corrupts FIFOCI bits, causing tef head == tail.
+	 */
+	if (!len)
+		return 0;
 
 	return regmap_bulk_read(priv->map_rx,
 				mcp251xfd_get_tef_obj_addr(offset),
